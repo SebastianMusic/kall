@@ -1,31 +1,23 @@
-use color_eyre::Result;
-use crossterm::event::read;
+use color_eyre::owo_colors::OwoColorize;
 use ratatui::{
     buffer::Buffer,
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
-    layout::{Constraint, Layout, Rect},
+    layout::Rect,
     prelude::*,
-    style::{
-        palette::tailwind::{BLUE, GREEN, SLATE},
-        Color, Modifier, Style, Stylize,
-    },
-    symbols,
+    style::{Color, Stylize},
     symbols::border,
     text::Line,
-    widgets::{
-        Block, Borders, HighlightSpacing, List, ListItem, ListState, Padding, Paragraph,
-        StatefulWidget, Widget, Wrap,
-    },
+    widgets::{Block, Paragraph, Widget},
     DefaultTerminal, Frame,
 };
 use std::fs::read_to_string;
 
-use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use chrono::{NaiveDate, TimeZone, Utc};
 
 use icalendar::{Calendar, CalendarComponent, CalendarDateTime, Component, DatePerhapsTime};
 
+use std::collections::HashMap;
 use std::io;
-use std::{collections::HashMap, fmt::Alignment};
 // Main calendar datastructure
 #[derive(Debug, Default)]
 struct KallEvent {
@@ -38,9 +30,20 @@ const TOTAL_ROWS: usize = 96;
 const TOTAL_COLS: usize = 8;
 const CLOCK_WIDTH: u16 = 6;
 
+#[derive(Debug)]
+struct CursorPos {
+    x: u16,
+    y: u16,
+}
+
 struct App {
     events: HashMap<NaiveDate, Vec<icalendar::Event>>,
     scroll_offset: usize,
+    cursor_pos: CursorPos,
+    screen_height: u16,
+    screen_width: u16,
+    visible_days: u16,
+    visible_day_width: u16,
     exit: bool,
 }
 fn truncate(s: &str, max_width: usize) -> String {
@@ -85,7 +88,15 @@ impl App {
         App {
             events: parse_calendar_file(),
             scroll_offset: 0,
+            cursor_pos: CursorPos {
+                x: CLOCK_WIDTH,
+                y: 0,
+            },
             exit: false,
+            screen_width: 0,
+            screen_height: 0,
+            visible_days: 7,
+            visible_day_width: 0,
         }
     }
 
@@ -97,9 +108,12 @@ impl App {
         Ok(())
     }
 
-    fn draw(&self, frame: &mut Frame) {
-        let weekly_n = 7 + 1;
-        let daily_n = 62;
+    fn draw(&mut self, frame: &mut Frame) {
+        self.screen_height = frame.area().height;
+        self.screen_width = frame.area().width;
+
+        let _weekly_n = 7 + 1;
+        let _daily_n = 62;
         // let weekly_layout_constraint = (0..weekly_n)
         //     .map(|_| Constraint::Ratio(1, weekly_n))
         //     .collect::<Vec<_>>();
@@ -129,11 +143,10 @@ impl App {
         //     .collect::<Vec<_>>();
 
         let visible_rows = frame.area().height as usize;
-        let visible_days = 7;
 
         let area = frame.area();
 
-        let width_per_day = (area.width - CLOCK_WIDTH) / visible_days;
+        self.visible_day_width = (area.width - CLOCK_WIDTH) / self.visible_days;
 
         for screen_row in 0..visible_rows {
             let logical_row = screen_row + self.scroll_offset;
@@ -151,21 +164,39 @@ impl App {
                 height: 1,
             };
 
-            for days in 0..visible_days {
+            for days in 0..self.visible_days {
                 let day_rect = Rect {
-                    x: (area.x + CLOCK_WIDTH) + (width_per_day * days),
+                    x: (area.x + CLOCK_WIDTH) + (self.visible_day_width * days),
                     y: area.y + screen_row as u16,
-                    width: width_per_day,
+                    width: self.visible_day_width,
                     height: 1,
                 };
                 let test_string = "test string hello hello";
-                let test_label =
-                    format!("{}|", truncate(&test_string, (width_per_day - 1) as usize));
+                let test_label = format!(
+                    "{}|",
+                    truncate(&test_string, (self.visible_day_width - 1) as usize)
+                );
                 frame.render_widget(Paragraph::new(test_label), day_rect);
             }
 
             let clock_label = format!("{:02}:{:02}|", hour, minute);
             frame.render_widget(Paragraph::new(clock_label), clock_rect);
+
+            // check for cursor mistakes
+            if (self.cursor_pos.x < CLOCK_WIDTH) {
+                self.cursor_pos.x = CLOCK_WIDTH
+            }
+            // draw cursor once per iteration
+            let cursor_rec = Rect {
+                x: self.cursor_pos.x,
+                y: self.cursor_pos.y,
+                width: 1,
+                height: 1,
+            };
+            frame.render_widget(
+                Paragraph::new("x").style(Style::default().fg(Color::Red)),
+                cursor_rec,
+            );
         }
     }
 
@@ -184,6 +215,9 @@ impl App {
             KeyCode::Char('q') => self.exit(),
             KeyCode::Char('k') => self.scroll_down(),
             KeyCode::Char('l') => self.scroll_up(),
+            KeyCode::Char(';') => self.scroll_right(),
+            KeyCode::Char('j') => self.scroll_left(),
+
             _ => {}
         }
     }
@@ -193,21 +227,48 @@ impl App {
     }
 
     fn scroll_down(&mut self) {
-        if self.scroll_offset + 1 > TOTAL_ROWS {
+        // if the cursor is at the end of the screen. Scroll the screen
+        if (self.cursor_pos.y + 1) >= self.screen_height {
+            if self.scroll_offset + 1 > TOTAL_ROWS {
+                return;
+            }
+            self.scroll_offset += 1;
             return;
         }
-        self.scroll_offset += 1
+        // else its inside move cursor pos with 1
+        self.cursor_pos.y += 1;
     }
     fn scroll_up(&mut self) {
-        if self.scroll_offset == 0 {
+        // if the cursor is at the top of the screen. Scroll the screen
+        if self.cursor_pos.y == 0 {
+            if self.scroll_offset == 0 {
+                return;
+            }
+            self.scroll_offset -= 1;
             return;
         }
-        self.scroll_offset -= 1
+        // else its inside move cursor pos with 1
+        self.cursor_pos.y -= 1;
+    }
+    fn scroll_right(&mut self) {
+        let end_of_days = CLOCK_WIDTH + (self.visible_day_width * self.visible_days);
+        let pos_after = self.cursor_pos.x + self.visible_day_width;
+        if pos_after >= end_of_days {
+            return;
+        }
+        self.cursor_pos.x += self.visible_day_width;
+    }
+
+    fn scroll_left(&mut self) {
+        if self.cursor_pos.x <= CLOCK_WIDTH {
+            return;
+        }
+        self.cursor_pos.x -= self.visible_day_width;
     }
 }
 
 impl Widget for &App {
-    fn render(self, area: Rect, buf: &mut Buffer) {
+    fn render(self, _area: Rect, _buf: &mut Buffer) {
         let title = Line::from(" Counter App Tutorial".bold());
         let instructions = Line::from(vec![
             " Decrement ".into(),
@@ -217,35 +278,37 @@ impl Widget for &App {
             " Quit ".into(),
             "<Q>".blue().bold(),
         ]);
-        let outer_block = Block::bordered()
+        let _outer_block = Block::bordered()
             .title(title.centered())
             .title_bottom(instructions.centered())
             .border_set(border::THICK);
     }
 }
 
-// fn main() -> io::Result<()> {
-//     ratatui::run(|terminal| App::new().run(terminal))
-// }
-//
-
-// main function for testing stuff
-fn main() {
-    let app = App::new();
-
-    // for (date, events) in &app.events {
-    //     println!("{}", date)
-    // }
-
+fn main() -> io::Result<()> {
+    let mut app = App::new();
     let dt = Utc.with_ymd_and_hms(2025, 09, 04, 07, 15, 00).unwrap();
     let d = dt.date_naive();
-    println!("{:?}", d);
-    let eventsTest = app.events.get(&d);
-    let Some(events) = eventsTest else {
-        println!("events empty");
-        return;
-    };
-    for event in events {
-        println!("{:?}", event.get_start())
-    }
+    ratatui::run(|terminal| app.run(terminal))
 }
+
+// main function for testing stuff
+// fn main() {
+//     let app = App::new();
+//
+//     for (date, events) in &app.events {
+//         println!("{}", date)
+//     }
+//
+//     let dt = Utc.with_ymd_and_hms(2025, 09, 04, 07, 15, 00).unwrap();
+//     let d = dt.date_naive();
+//     println!("{:?}", d);
+//     let eventsTest = app.events.get(&d);
+//     let Some(events) = eventsTest else {
+//         println!("events empty");
+//         return;
+//     };
+//     for event in events {
+//         println!("{:?}", event.get_start())
+//     }
+// }
